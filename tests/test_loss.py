@@ -89,10 +89,14 @@ def test_assigner_assigns_at_most_one_gt_per_anchor():
     boxes = mx.array([[[10.0, 10.0, 30.0, 30.0], [20.0, 20.0, 40.0, 40.0], [0.0, 0.0, 16.0, 16.0]]])
     gt = mx.array([[[10.0, 10.0, 34.0, 34.0], [18.0, 18.0, 44.0, 44.0]]])
     mask = mx.ones((1, 2, 1))
-    _, target_scores, fg, idx = assigner(scores, boxes, anchors, mx.array([[[0.0], [1.0]]]), gt, mask)
+    _, target_labels, target_scale, fg, idx = assigner(
+        scores, boxes, anchors, mx.array([[[0.0], [1.0]]]), gt, mask
+    )
     assert int(np.array(fg).sum()) <= 3
+    assert np.array(target_labels).shape == fg.shape
+    assert np.array(target_scale).shape == fg.shape  # one normalisation value per anchor
     assert np.array(idx)[np.array(fg)].max() < 2  # every positive points at a real ground truth
-    assert np.array(target_scores).sum() > 0
+    assert np.array(mx.where(fg, target_scale, 0.0)).sum() > 0  # foreground anchors carry a target
 
 
 def test_assigner_handles_empty_batch():
@@ -101,8 +105,8 @@ def test_assigner_handles_empty_batch():
     boxes = mx.zeros((2, 10, 4))
     anchors = mx.zeros((10, 2))
     out = assigner(scores, boxes, anchors, mx.zeros((2, 0, 1)), mx.zeros((2, 0, 4)), mx.zeros((2, 0, 1)))
-    assert int(np.array(out[2]).sum()) == 0
-    assert np.array(out[1]).sum() == 0.0
+    assert int(np.array(out[3]).sum()) == 0
+    assert np.array(out[2]).sum() == 0.0  # the per-anchor target scale
 
 
 def test_batchnorm_training_statistics_accumulate():

@@ -97,17 +97,19 @@ MLX GPU, best of three 20-iteration medians — full tables, methodology and cav
 
 | YOLO26n | 256px b1 | 640px b1 | 640px b8 | s 640 b1 |
 | --- | ---: | ---: | ---: | ---: |
-| inference (NMS-free) | **3.4x** | **2.2x** | **1.5x** | **1.4x** |
-| criterion (forward) | **3.2x** | **1.9x** | **1.2x** | **1.4x** |
-| train step (fwd+loss+bwd) | **2.0x** | **1.8x** | **2.4x** | **1.9x** |
+| inference (NMS-free) | **3.4x** | **2.2x** | **1.6x** | **1.4x** |
+| criterion (forward) | **3.5x** | **2.1x** | **1.5x** | **1.5x** |
+| train step (fwd+loss+bwd) | **2.0x** | **1.8x** | **2.5x** | **1.9x** |
 | MuSGD step | **2.0x** | **1.9x** | **2.6x** | **6.2x** |
 | TAL assigner | **2.1x** | **1.9x** | **1.1x** | **2.0x** |
 
 Every stage is faster than PyTorch, and the unfused MLX model also beats torch's *BN-fused* one
-(1.04-1.23x). The wins come from fusing conv+BatchNorm+SiLU into one compiled block per layer and
-keeping BatchNorm's statistics to a single reduction; see `BENCHMARKS.md` for the measurements, the
-`mx.compile` caching rules that made those graphs safe, and the one remaining structural gap (MPS
-has a fused BatchNorm kernel, MLX composes it).
+(1.04-1.23x). The wins come from fusing conv+BatchNorm+SiLU into one compiled block per layer,
+compiling the assigner's broadcast geometry, keeping the alignment targets sparse, and prefetching
+batches so augmentation overlaps the GPU. End-to-end training throughput (augmentation included) is
+18 -> 45 img/s with `workers=2`, against a 95 img/s compute ceiling. `BENCHMARKS.md` has the
+measurements, the `mx.compile` caching rules that made those graphs safe, and what is left
+(`mx.argpartition` in the assigner, GIL contention in the loader).
 
 ## Tests
 

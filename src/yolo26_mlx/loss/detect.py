@@ -108,7 +108,7 @@ class DetectionLoss:
         mask_gt = mx.expand_dims(mx.sum(gt_bboxes, axis=-1) > 0, -1)
 
         pred_bboxes = self.bbox_decode(anchor_points, pred_dist)  # grid units, xyxy
-        target_bboxes, target_scores, fg_mask, _ = self.assigner(
+        target_bboxes, target_labels, target_scale, fg_mask, _ = self.assigner(
             mx.stop_gradient(mx.sigmoid(pred_scores)),
             mx.stop_gradient(pred_bboxes * stride_tensor),
             anchor_points * stride_tensor,
@@ -116,13 +116,14 @@ class DetectionLoss:
             gt_bboxes,
             mask_gt,
         )
-        target_scores_sum = mx.maximum(mx.sum(target_scores), 1.0)
-        fg = mx.expand_dims(fg_mask, -1)
-        weight = mx.sum(mx.where(fg > 0, target_scores, 0.0), axis=-1, keepdims=True)  # (b, A, 1)
+        # Per-anchor alignment target: scale[b] on foreground anchors, 0 elsewhere. Summing this is
+        # the reference's ``target_scores.sum()``, and it doubles as the box/distribution weight.
+        weight = mx.where(fg_mask, target_scale, 0.0)[..., None]  # (b, A, 1)
+        target_scores_sum = mx.maximum(mx.sum(weight), 1.0)
 
-        loss_cls = mx.sum(_bce_with_logits(pred_scores, target_scores)) / target_scores_sum
+        loss_cls = self._cls_loss(pred_scores, target_labels, weight, target_scores_sum)
 
-        idx = _fg_index(fg)
+        idx = _fg_index(fg_mask)
         if idx.size > 0:
             n_anchors = pred_dist.shape[1]
             anchor_ids = idx % n_anchors  # the same anchors are shared by both branch tensors
@@ -138,6 +139,22 @@ class DetectionLoss:
 
         loss = mx.array([loss_box * self.hyp.box, loss_cls * self.hyp.cls, loss_dist * self.hyp.dist_gain])
         return mx.sum(loss), dict(zip(self.loss_names, [float(v) for v in loss], strict=False))
+
+    def _cls_loss(self, pred_scores, target_labels, weight, target_scores_sum):
+        """BCE against the sparse alignment targets.
+
+        ``BCE(x, t) = softplus(x) - x * t``, and ``t`` is non-zero only at each foreground anchor's
+        own class, so the sum collapses to ``sum(softplus)`` over the whole (b, A, nc) logit tensor
+        minus one gathered value per foreground anchor. That avoids building the dense target matrix
+        and computing BCE on it element by element.
+        """
+        total = mx.sum(_softplus(pred_scores))
+        if weight.size and bool(mx.any(weight > 0).item()):
+            per_anchor = weight[..., 0]  # target value per anchor: scale on foreground anchors
+            cols = mx.where(per_anchor > 0, target_labels, 0)[:, :, None]
+            gathered = mx.take_along_axis(pred_scores, cols, axis=-1)[..., 0]
+            total = total - mx.sum(mx.where(per_anchor > 0, gathered * per_anchor, 0.0))
+        return total / target_scores_sum
 
     def _dist_loss(self, pred_dist, anchor_points, stride_tensor, imgsz, target_bboxes, weight):
         """DFL term (reg_max > 1) or the DFL-free L1 term on image-normalised ltrb.
@@ -192,11 +209,11 @@ class E2EDetectLoss:
 
 # ----------------------------------------------------------------------- helpers
 def _fg_index(fg: mx.array) -> mx.array:
-    """Flat (batch, anchor) indices of the foreground mask, shaped (M,).
+    """Flat (batch, anchor) indices of the foreground mask ``(b, A)``, shaped (M,).
 
     MLX has no ``nonzero``, so order the flattened mask and take the leading ones.
     """
-    flat = (fg[..., 0] > 0).astype(mx.int32).reshape(-1)
+    flat = (fg > 0).astype(mx.int32).reshape(-1)
     return mx.argsort(-flat)[: int(flat.sum().item())]
 
 
@@ -208,6 +225,11 @@ def _aligned_mean(values: mx.array, weight: mx.array) -> mx.array:
 def _bce_with_logits(x: mx.array, target: mx.array) -> mx.array:
     """Numerically stable elementwise BCE with logits."""
     return mx.maximum(x, 0) - x * target + mx.log1p(mx.exp(-mx.abs(x)))
+
+
+def _softplus(x: mx.array) -> mx.array:
+    """``log(1 + exp(x))`` without overflow."""
+    return mx.maximum(x, 0) + mx.log1p(mx.exp(-mx.abs(x)))
 
 
 def _dfl(pred_dist: mx.array, target: mx.array) -> mx.array:

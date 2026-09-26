@@ -11,14 +11,17 @@ depend on it.
 ## Correctness bar
 Before believing any change is right, check it against evidence, in this order:
 
-1. `uv run pytest -q` — 46 tests, ~21s, must stay green.
+1. `uv run pytest -q` — 50 tests, ~21s, must stay green.
 2. `uv run python tools/check_parity.py --scale n --imgsz 256` — numerical parity with PyTorch
    (forward, both branch outputs, decoded outputs, NMS-free top-k, both loss terms). Needs
    reference data from `tools/export_reference.py`; the parity tests skip if it is missing.
 3. Parameter counts must stay equal to the published values for all five scales
    (n 2,572,280 / s 10,009,784 / m 21,896,248 / l 26,299,704 / x 58,993,368).
 4. `BENCHMARKS.md` must be refreshed if a change plausibly moves throughput: the GPU is shared, so
-   measure best-of-three and check the spread before believing a number.
+   measure best-of-three and check the spread before believing a number. Report model *and*
+   end-to-end img/s - augmentation is CPU-side and used to be the bottleneck.
+5. The criterion's cost is driven by objects per image (it is evaluated over
+   `(batch, ground truths, anchors)`), so benchmark it at 2 *and* ~100 objects/image.
 
 ## Ground rules for the MLX code
 - NHWC everywhere, `mx.array` values in float32, params addressed by dotted name.

@@ -23,23 +23,22 @@ most cells.
 
 | stage | n 256 b1 | n 640 b1 | n 640 b8 | s 640 b1 |
 | --- | ---: | ---: | ---: | ---: |
-| inference, NMS-free head | **3.40x** | **2.18x** | **1.48x** | **1.38x** |
-| inference, one-to-many head | **3.83x** | **2.24x** | **1.65x** | **1.40x** |
-| criterion (forward) | **3.22x** | **1.94x** | **1.24x** | **1.37x** |
-| train step (fwd+loss+bwd) | **2.00x** | **1.76x** | **2.42x** | **1.91x** |
-| MuSGD step | **1.99x** | **1.90x** | **2.64x** | **6.24x** |
-| TAL assigner | **2.12x** | **1.85x** | **1.11x** | **2.01x** |
+| inference, NMS-free head | **3.4x** | **2.2x** | **1.6x** | **1.4x** |
+| criterion (forward) | **3.5x** | **2.1x** | **1.5x** | **1.5x** |
+| train step (fwd+loss+bwd) | **2.0x** | **1.8x** | **2.5x** | **1.9x** |
+| MuSGD step | **2.0x** | **1.9x** | **2.6x** | **6.2x** |
+| TAL assigner | **2.1x** | **1.9x** | **1.1x** | **2.0x** |
 
 Raw medians (ms), MLX eager vs torch MPS:
 
 | stage | 256 b1 | 640 b1 | 640 b8 | s 640 b1 |
 | --- | --- | --- | --- | --- |
-| inference (e2e / o2m) | 4.8 / 4.6 | 8.1 / 7.9 | 39.9 / 39.2 | 16.1 / 15.7 |
-| criterion (forward) | 12.5 | 19.9 | 99.0 | 30.4 |
-| train step (fwd+loss+bwd) | 33.8 | 43.4 | 148.8 | 54.5 |
+| inference (NMS-free) | 4.8 | 8.1 | 38.1 | 15.3 |
+| criterion (forward) | 11.5 | 18.3 | 83.4 | 27.7 |
+| train step (fwd+loss+bwd) | 34.2 | 42.2 | 142.1 | 54.6 |
 | MuSGD step | 21.4 | 21.5 | 21.8 | 20.7 |
 | TAL assigner | 1.1 | 1.2 | 5.2 | 1.2 |
-| *torch reference* | *16.4 / 17.7* | *17.7 / 17.6* | *59.1 / 64.5* | *22.2 / 22.0* |
+| *torch reference* | *16.4* | *17.7* | *59.1* | *22.2* |
 
 Torch's own BN-fused model (its best inference configuration) is 8.4 ms at 640 b1, 49.1 ms at 640 b8
 and 17.0 ms on s. The unfused MLX model is faster than that too (8.1 / 39.9 / 16.1 ms), i.e. 1.04x,
@@ -86,6 +85,27 @@ fusion *helps* the folded model less than the unfolded one, because folding remo
 graph would have fused for free (640 b8: 39.9 ms unfolded, 53.0 ms folded) - folding is for export,
 not for MLX inference.
 
+## End-to-end training throughput
+
+The tables above are model-only. With augmentation included (720p source images, 640px, batch 16,
+mosaic on), the pipeline is different: augmentation is PIL/NumPy on the CPU and does not touch the
+GPU, so it has to overlap with the training step.
+
+| configuration | img/s |
+| --- | ---: |
+| loader inline (`workers=0`) | 18.1 |
+| loader with 2 threads (`workers=2`, the default) | **45.4** |
+| loader with 3 threads | 45.3 |
+| training step alone (ceiling, 8 objects/image) | 94.6 |
+
+`YOLOBatchLoader` draws the index order on the calling thread and prepares batches in a bounded
+thread pool, so prefetching cannot change *what* an epoch contains, only when it is ready
+(`tests/test_train.py` asserts both properties). Augmentation is GIL-bound: one worker is no faster
+than none, two nearly double it, and a third adds nothing - the remaining gap to the 94.6 img/s
+ceiling is GIL contention between the workers and the main thread's graph construction, not raw CPU
+work. Escaping it needs process-based workers, which would move the per-batch images across a pipe
+and is the obvious next step rather than more threading.
+
 ## Where the remaining differences come from
 
 - **BatchNorm is the one place MPS has a real kernel advantage**: its `batch_norm` is a single fused
@@ -96,9 +116,26 @@ not for MLX inference.
   (`tools/bench_convs.py`) shows the stem (3 -> 16 channels at 640px) at 1.02 ms in MLX vs 0.52 ms on
   MPS, while 1x1 and depthwise convolutions are slightly *faster* in MLX. The fused block hides most
   of this; the per-layer profile (`tools/profile_layers.py`) is what localises it.
-- **The criterion is forward-bound at 640px/batch 8**: of the 99 ms, ~60 ms is the forward pass and
-  ~34 ms the two branches' loss math. Our loss math is already faster than torch's; the forward
-  gap is BatchNorm.
+- **The criterion scales with objects per image, and that is where most of its time goes.** The
+  assigner is evaluated over a (batch, ground truths, anchors) tensor, so a 640px image with 100
+  objects costs far more than one with 2. Measured at 640px/batch 8:
+
+  | objects/image | criterion per branch | assigner |
+  | ---: | ---: | ---: |
+  | 2 | 7.7 ms | 4.4 ms |
+  | 20 | 10.5 ms | 7.2 ms |
+  | 100 | 24.8 ms | 21.5 ms |
+
+  What the optimization pass changed here: the CIoU over that broadcast geometry is now one
+  compiled graph (18.7 -> 3.8 ms), the top-k claim count is one reduction instead of a Python loop
+  per ground truth (the single worst scaling bug: 6.0 -> 3.3 ms at G=100), and the alignment targets
+  are sparse - the criterion uses `(label, scale)` per anchor instead of materialising a dense
+  `(b, A, nc)` one-hot matrix, which also lets BCE collapse to `sum(softplus) - sum(positives)`.
+  Overall 45.8 -> 24.8 ms per branch at 100 objects/image.
+- **`mx.argpartition` is now the floor of the assigner**: ~7 ms for one (8, 100, 8400) partition, and
+  the reference needs one (top-k) plus a second for `topk2`. A blocked two-stage top-k (max-pool
+  blocks, then partition only the winning blocks) would cut that to ~1-2 ms, at the cost of an
+  exactness caveat around ties. Not done.
 - **`fuse()` is a deployment tool, not a speed-up here** (see above).
 
 ## Caveats
