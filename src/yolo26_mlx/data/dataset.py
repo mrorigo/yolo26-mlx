@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import math
 import random
+from collections import deque
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import mlx.core as mx
@@ -328,25 +330,59 @@ class YOLOBatchLoader:
     """Batches a :class:`DetectionDataset`; shuffles and drops the last partial batch when training."""
 
     def __init__(
-        self, dataset: DetectionDataset, batch_size: int = 16, shuffle: bool = True, drop_last: bool = True
+        self,
+        dataset: DetectionDataset,
+        batch_size: int = 16,
+        shuffle: bool = True,
+        drop_last: bool = True,
+        workers: int = 0,
+        prefetch: int = 2,
     ) -> None:
+        """
+        Args:
+            workers: threads that prepare batches ahead of the consumer. Augmentation is PIL/NumPy
+                and does not touch the GPU, so a single worker overlaps it with the training step
+                and roughly doubles end-to-end throughput; ``0`` prepares batches inline.
+            prefetch: batches buffered ahead of the consumer (bounds memory to a few batches).
+        """
         self.dataset = dataset
         self.batch_size = batch_size
         self.shuffle = shuffle
         self.drop_last = drop_last
+        self.workers = max(workers, 0)
+        self.prefetch = max(prefetch, 1)
 
     def __len__(self) -> int:
         n = len(self.dataset)
         return n // self.batch_size if self.drop_last else math.ceil(n / self.batch_size)
 
-    def __iter__(self):
+    def _indices(self) -> list[list[int]]:
         order = list(range(len(self.dataset)))
         if self.shuffle:
-            random.shuffle(order)
-        for start in range(0, len(order), self.batch_size):
-            ids = order[start : start + self.batch_size]
-            if self.drop_last and len(ids) < self.batch_size:
-                break
-            images, targets = zip(*[self.dataset[i] for i in ids], strict=True)
-            batch = np.stack([self.dataset.to_mx(im) for im in images])
-            yield mx.array(batch), DetectionDataset.to_batch(list(targets), self.dataset.imgsz)
+            random.shuffle(order)  # drawn up front, so prefetching cannot change the order
+        batches = [order[start : start + self.batch_size] for start in range(0, len(order), self.batch_size)]
+        if self.drop_last:
+            batches = [b for b in batches if len(b) == self.batch_size]
+        return batches
+
+    def _build(self, ids: list[int]):
+        images, targets = zip(*[self.dataset[i] for i in ids], strict=True)
+        batch = np.stack([DetectionDataset.to_mx(im) for im in images])
+        return mx.array(batch), DetectionDataset.to_batch(list(targets), self.dataset.imgsz)
+
+    def __iter__(self):
+        batches = self._indices()
+        if not self.workers:
+            for ids in batches:
+                yield self._build(ids)
+            return
+        # keep at most `prefetch` batches in flight so memory stays bounded regardless of
+        # dataset size; the workers do the PIL work while the consumer runs on the GPU
+        with ThreadPoolExecutor(max_workers=self.workers, thread_name_prefix="loader") as pool:
+            pending: deque = deque()
+            for ids in batches[: self.prefetch]:
+                pending.append(pool.submit(self._build, ids))
+            for start in range(len(batches)):
+                if start + self.prefetch < len(batches):
+                    pending.append(pool.submit(self._build, batches[start + self.prefetch]))
+                yield pending.popleft().result()

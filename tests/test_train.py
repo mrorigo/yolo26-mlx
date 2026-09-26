@@ -128,6 +128,33 @@ def overfit_model(tmp_path_factory, shapes_root):
     return trainer, cfg
 
 
+def test_prefetching_loader_matches_inline(shapes_root):
+    """Prefetching must not change what the loader yields, only when it is ready."""
+    ds = DetectionDataset(
+        shapes_root, imgsz=64, augment=False, image_dir="images/train", label_dir="labels/train"
+    )
+    inline = list(YOLOBatchLoader(ds, batch_size=2, shuffle=False, drop_last=False, workers=0))
+    prefetched = list(YOLOBatchLoader(ds, batch_size=2, shuffle=False, drop_last=False, workers=2, prefetch=2))
+    assert len(inline) == len(prefetched) == 2
+    for (x_a, b_a), (x_b, b_b) in zip(inline, prefetched, strict=True):
+        assert np.array_equal(np.array(x_a), np.array(x_b))
+        for key in b_a:
+            assert np.array_equal(np.array(b_a[key]), np.array(b_b[key]))
+
+
+def test_prefetching_loader_drops_nothing(shapes_root):
+    """Every sample must arrive exactly once, whatever the prefetch depth."""
+    ds = DetectionDataset(
+        shapes_root, imgsz=64, augment=False, image_dir="images/train", label_dir="labels/train"
+    )
+    for workers, prefetch in ((0, 1), (2, 1), (3, 4)):
+        loader = YOLOBatchLoader(
+            ds, batch_size=2, shuffle=False, drop_last=True, workers=workers, prefetch=prefetch
+        )
+        seen = sum(images.shape[0] for images, _ in loader)
+        assert seen == len(ds), f"workers={workers} prefetch={prefetch}"
+
+
 def test_training_fits_a_tiny_dataset(overfit_model):
     trainer, _cfg = overfit_model
     # the model must clearly learn. Compare the per-term criterion values, not the total: the

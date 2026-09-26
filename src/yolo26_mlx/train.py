@@ -31,7 +31,7 @@ class TrainConfig:
     imgsz: int = 640
     epochs: int = 100
     batch: int = 16
-    workers: int = 0
+    workers: int = 2  # loader threads; augmentation is GIL-bound, so 2 is the sweet spot
     optimizer: str = "MuSGD"
     lr0: float = 0.01
     lrf: float = 0.01
@@ -127,14 +127,16 @@ class Trainer:
     # ---------------------------------------------------------------------- train
     def train(self) -> list[dict]:
         cfg = self.cfg
-        train_set = self._dataset(split="train", augment=True)
-        val_set = self._dataset(split="val", augment=False)
-        loader = YOLOBatchLoader(train_set, batch_size=cfg.batch, shuffle=True)
-        steps = max(len(loader), 1)
+        val_set = self._dataset(split="val", augment=False, mosaic=0.0)
+        steps = math.ceil(len(self._dataset(split="train", augment=True, mosaic=cfg.mosaic)) / cfg.batch)
+        steps = max(steps, 1)
         self.model.train(True)
         for epoch in range(cfg.epochs):
             mosaic = cfg.mosaic if epoch < cfg.epochs - cfg.close_mosaic else 0.0
-            train_set.hyp = _with_mosaic(cfg, mosaic)
+            # rebuild the loader each epoch: its worker threads capture the augmentation gains
+            # (close_mosaic changes them), and the index order is drawn when iteration starts
+            train_set = self._dataset(split="train", augment=True, mosaic=mosaic)
+            loader = YOLOBatchLoader(train_set, batch_size=cfg.batch, shuffle=True, workers=cfg.workers)
             self.criterion.update()  # Progressive Loss: one-to-many weight decays
             self.model.train(True)
             t0, total, seen, lr = time.time(), 0.0, 0, cfg.lr0
@@ -201,21 +203,20 @@ class Trainer:
             group["momentum"] = momentum
             group["lr"] = bias_lr if group.get("param_group") == "norm" else lr
 
-    def _dataset(self, split: str, augment: bool) -> DetectionDataset:
+    def _dataset(self, split: str, augment: bool, mosaic: float = 0.0) -> DetectionDataset:
         cfg = self.cfg
         root = Path(cfg.data)
         image_dir, label_dir = "images", "labels"
         if (root / image_dir / split).is_dir():
             image_dir, label_dir = f"{image_dir}/{split}", f"{label_dir}/{split}"
-        dataset = DetectionDataset(
+        return DetectionDataset(
             root,
             imgsz=cfg.imgsz,
-            hyp=_with_mosaic(cfg, cfg.mosaic if augment else 0.0),
+            hyp=_with_mosaic(cfg, mosaic if augment else 0.0),
             augment=augment,
             image_dir=image_dir,
             label_dir=label_dir,
         )
-        return dataset
 
     # ----------------------------------------------------------------- checkpoint
     def save(self, epoch: int) -> None:
