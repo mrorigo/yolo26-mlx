@@ -1,0 +1,12 @@
+line-length = 120
+target-version = "py313"
+
+[lint]
+select = ["E", "F", "I", "UP", "B", "SIM", "RUF"]
+ignore = [
+  "E741",   # single-letter names are the notation for box/tensor components
+  "RUF046", # explicit int() around round() is clearer than the ~ trick
+]
+
+[lint.per-file-ignores]
+"tools/*" = ["F841", "RUF059"]  # reference exporters keep every dumped tensor name
