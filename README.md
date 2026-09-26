@@ -5,6 +5,8 @@ A ground-up implementation of [YOLO26](https://docs.ultralytics.com/models/yolo2
 losses, label assignment, optimizer, data pipeline and metrics are written directly against the
 MLX API.
 
+> This implementation was one-shot:ed from the goal defined in [AGENTS.md](./AGENTS.md) by Space Bunny Alpha in ~1h.
+
 ## What is implemented
 
 | Piece | Notes |
@@ -86,6 +88,25 @@ uv venv refenv && uv pip install --python refenv/bin/python torch ultralytics sa
 refenv/bin/python tools/export_reference.py --scale n --imgsz 256
 .venv/bin/python tools/check_parity.py --scale n --imgsz 256
 ```
+
+## Performance vs PyTorch
+
+Measured against the same Ultralytics reference on an idle M1 Pro (both eager, MPS vs MLX GPU,
+best of three 20-iteration medians) — full tables, methodology and caveats in
+[BENCHMARKS.md](BENCHMARKS.md):
+
+| YOLO26n | 256px b1 | 640px b1 | 640px b8 |
+| --- | ---: | ---: | ---: |
+| inference (NMS-free) | **2.5x** | **1.5x** | **1.07x** |
+| inference (BN folded) | **1.2x** | 0.9x | 0.9x |
+| criterion (forward) | **1.6x** | **1.2x** | 0.8x |
+| train step (fwd+loss+bwd) | **1.9x** | **1.8x** | **2.1x** |
+| MuSGD step | **1.9x** | **1.9x** | **1.9x** |
+
+Training is consistently ~1.8-2.1x faster (MuSGD ~5.9x on YOLO26s); inference scales from 2.6x at
+256px down to parity at 640px with batch 8, where the graph is compute-bound. `fuse()` plus
+`model.compiled()` — what `yolo26-mlx predict` uses — reaches 37.8 ms at 640px/b8, 1.48x faster
+than torch MPS.
 
 ## Tests
 

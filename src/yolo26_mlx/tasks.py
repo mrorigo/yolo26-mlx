@@ -10,9 +10,7 @@ from .nn.conv import Conv
 from .nn.head import Detect
 from .nn.module import Module, Sequential
 
-__all__ = ["DetectionModel", "build_model"]
-
-REPEATABLE = (C3k2, C2f, C2PSA, SPPF)
+__all__ = ["CompiledModel", "DetectionModel", "build_model"]
 
 
 class DetectionModel(Module):
@@ -30,7 +28,6 @@ class DetectionModel(Module):
         self.model = Sequential(*(self._make(s) for s in specs))
         self.stride = [8.0] * len(specs)
         self.names = None
-        self._built = False
         if verbose:
             self._print()
 
@@ -66,9 +63,8 @@ class DetectionModel(Module):
             total += n_params
             print(f"{spec.index:>3}{spec.frm!s:>8}{spec.n:>3}{n_params:>10,}  {spec.name:<12}{spec.args}")
         print(f"\nscale={self.meta['scale']} nc={self.meta['nc']} total params: {total:,}")
-        self._built = True
 
-    # ------------------------------------------------------------------ execution
+    # ----------------------------------------------------------------- execution
     def _resolve(self, spec: LayerSpec, outputs: list):
         """YAML `from` indices are 0-based module indices; -1 means "the previous layer"."""
         frm = spec.frm
@@ -79,20 +75,8 @@ class DetectionModel(Module):
     def forward(self, x):
         outputs: list = [x]
         for i, spec in enumerate(self.specs):
-            y = self.model[i](self._resolve(spec, outputs))
-            outputs.append(y)
+            outputs.append(self.model[i](self._resolve(spec, outputs)))
         return outputs[-1]
-
-    # -------------------------------------------------------------------- strides
-    def build_strides(self, imgsz: int = 256) -> None:
-        """Probe the graph with a dummy image to record per-level strides."""
-        self.train(False)
-        head = self.model[-1]
-        feats = self._forward_to_head(mx.zeros((1, imgsz, imgsz, 3)))
-        head.stride = [float(imgsz) / f.shape[1] for f in feats]
-        head._anchors, head.shape = None, None
-        self.stride = list(head.stride)
-        self.train(True)
 
     def _forward_to_head(self, x) -> list:
         """Run everything up to the Detect head and return its per-level input features."""
@@ -101,9 +85,51 @@ class DetectionModel(Module):
             outputs.append(self.model[i](self._resolve(spec, outputs)))
         return self._resolve(self.specs[-1], outputs)
 
+    # -------------------------------------------------------------------- strides
+    def build_strides(self, imgsz: int = 256) -> None:
+        """Probe the graph with a dummy image to record per-level strides."""
+        self.train(False)
+        head = self.model[-1]
+        head.stride = [float(imgsz) / f.shape[1] for f in self._forward_to_head(mx.zeros((1, imgsz, imgsz, 3)))]
+        head._anchors, head.shape = None, None
+        self.stride = list(head.stride)
+        self.train(True)
+
     @property
     def head(self) -> Detect:
         return self.model[-1]
+
+    def compiled(self) -> CompiledModel:
+        """Return a view of this model whose forward pass is a single ``mx.compile``d graph.
+
+        Eager mode pays Python dispatch for each of the ~120 layers; compiling the whole graph is
+        worth ~1.4x on inference at 640px. The original model is left untouched, so the compiled and
+        eager paths can both serve the same weights.
+
+        Inference only, and that restriction is deliberate. ``mx.compile`` turns arrays captured
+        from the enclosing scope into constants, so a compiled *training* forward would silently
+        keep the weights at their first-trace values: the loss stops moving after one step. Passing
+        the parameter tree in as an input instead makes the cache miss on every step, because the
+        optimizer hands out fresh arrays - measured 25x slower per step. Training stays eager.
+        """
+        if self.training:
+            raise RuntimeError(
+                "compiled() is an inference view; call model.eval() first. Compiling a training "
+                "forward either freezes the parameters or re-traces every step (see the docstring)."
+            )
+        return CompiledModel(self)
+
+
+class CompiledModel(Module):
+    """An ``mx.compile``d view of a :class:`DetectionModel` for inference."""
+
+    def __init__(self, model: DetectionModel) -> None:
+        super().__init__()
+        self.inner = model
+        self.graph = mx.compile(model)
+
+    def forward(self, x):
+        return self.graph(x)
 
 
 def build_model(

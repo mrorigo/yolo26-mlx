@@ -49,18 +49,19 @@ class BatchNorm(Module):
         self.register_buffer("running_var", mx.ones((num_features,)))
 
     def forward(self, x: mx.array) -> mx.array:
+        axes = (0, 1, 2)
         if self.training:
-            axes = (0, 1, 2)
             n = x.shape[0] * x.shape[1] * x.shape[2]
             mean = mx.mean(x, axis=axes)
-            var = mx.mean((x - mean) * (x - mean), axis=axes)
+            var = mx.var(x, axis=axes)  # one fused reduction; (x - mean)**2 costs two extra passes
             unbiased = var * n / max(n - 1, 1)  # running_var tracks the unbiased estimate
             self.running_mean[...] = (1 - self.momentum) * self.running_mean + self.momentum * mean
             self.running_var[...] = (1 - self.momentum) * self.running_var + self.momentum * unbiased
         else:
             mean, var = self.running_mean, self.running_var
-        x = (x - mean) * mx.rsqrt(var + self.eps)
-        return x * self.weight + self.bias
+        # fold the normalisation into an affine map: one elementwise pass instead of three
+        scale = self.weight * mx.rsqrt(var + self.eps)
+        return x * scale + (self.bias - mean * scale)
 
 
 class Conv2d(Module):

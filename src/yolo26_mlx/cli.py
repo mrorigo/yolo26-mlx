@@ -31,15 +31,19 @@ def predict(
     iou: float = 0.7,
     nms: bool = True,
     max_det: int = 300,
+    compile: bool = True,
 ) -> list[dict]:
     """Run inference on a batched NHWC image tensor; returns per-image detections.
 
     Each detection is ``{boxes: (N, 4) xyxy, scores: (N,), classes: (N,)}``. With ``nms=False``
     the one-to-one head is used, which needs no NMS pass at all.
+
+    The head mode is set *before* the graph is compiled, since ``mx.compile`` freezes the Python
+    values it reads (including which head the ``end2end`` flag selects).
     """
     model.train(False)
     model.head.end2end = not nms
-    out = model(image)
+    out = (model.compiled() if compile else model)(image)
     if nms:
         raw = non_max_suppression(np.array(out), conf_thres=conf, iou_thres=iou, max_det=max_det)
     else:

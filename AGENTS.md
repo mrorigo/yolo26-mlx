@@ -11,12 +11,14 @@ depend on it.
 ## Correctness bar
 Before believing any change is right, check it against evidence, in this order:
 
-1. `uv run pytest -q` — 43 tests, ~17s, must stay green.
+1. `uv run pytest -q` — 46 tests, ~21s, must stay green.
 2. `uv run python tools/check_parity.py --scale n --imgsz 256` — numerical parity with PyTorch
    (forward, both branch outputs, decoded outputs, NMS-free top-k, both loss terms). Needs
    reference data from `tools/export_reference.py`; the parity tests skip if it is missing.
 3. Parameter counts must stay equal to the published values for all five scales
    (n 2,572,280 / s 10,009,784 / m 21,896,248 / l 26,299,704 / x 58,993,368).
+4. `BENCHMARKS.md` must be refreshed if a change plausibly moves throughput: the GPU is shared, so
+   measure best-of-three and check the spread before believing a number.
 
 ## Ground rules for the MLX code
 - NHWC everywhere, `mx.array` values in float32, params addressed by dotted name.
@@ -32,7 +34,12 @@ Before believing any change is right, check it against evidence, in this order:
 - Attention reshapes must move the channel axis *before* the spatial axis
   (`transpose(0, 3, 1, 2)`), not after — the wrong order is numerically wrong but still runs.
 - BatchNorm must use Ultralytics' eps=1e-3 / momentum=0.03 (set by their `initialize_weights`),
-  with the *unbiased* variance in the running stats.
+  with the *unbiased* variance in the running stats. Keep the two-pass-free form: one `mx.var`
+  reduction and a single fused affine (`x * scale + shift`); the naive form cost 40% of the 640px
+  forward pass.
+- `mx.compile` is inference only, and only on a model in eval mode (`model.compiled()` enforces
+  this). Compiling a training forward either freezes the parameters (scope capture becomes a
+  constant) or re-traces every step (25x slower); see the docstring on `DetectionModel.compiled`.
 - Anything added to `configs/*.yaml` must be reachable from `config.scale_config` and
   `tasks.DetectionModel._make`; keep the two in sync.
 

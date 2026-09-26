@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import mlx.core as mx
+import numpy as np
 import pytest
 
 from yolo26_mlx import build_model
@@ -95,3 +96,37 @@ def test_weight_roundtrip(tmp_path):
     model.train(False)
     other.train(False)
     assert mx.allclose(model(x), other(x), atol=1e-6).item()
+
+
+def test_compiled_inference_matches_eager():
+    """`mx.compile` is a pure optimisation: the same weights must give the same detections.
+
+    Compared as multisets: with an untrained head many scores are exactly tied, so fusion-level
+    rounding can legitimately swap the order of two detections or pick a different tied class.
+    """
+    model = build_model("yolo26", "n", imgsz=64, verbose=False)
+    model.build_strides(64)
+    model.train(False)
+    compiled = model.compiled()
+    x = mx.random.normal((1, 64, 64, 3))
+    eager, fast = np.array(model(x))[0], np.array(compiled(x))[0]
+    assert np.allclose(np.sort(eager[:, 4]), np.sort(fast[:, 4]), atol=1e-5)
+    assert np.allclose(np.sort(eager[:, :4], axis=0), np.sort(fast[:, :4], axis=0), atol=1e-2)
+
+
+def test_compiled_refuses_training_mode():
+    """Compiling a training forward would freeze the weights; the guard makes that explicit."""
+    model = build_model("yolo26", "n", imgsz=64, verbose=False)
+    model.build_strides(64)
+    model.train(True)
+    with pytest.raises(RuntimeError, match="inference view"):
+        model.compiled()
+
+
+def test_batchnorm_fold_matches_training_statistics():
+    """The folded conv must reproduce what BatchNorm computes from batch statistics."""
+    conv = Conv(4, 8, 3)
+    x = mx.random.normal((4, 12, 12, 4)) * 3 + 1
+    folded = conv.fuse()
+    conv.train(False)  # use the statistics just accumulated by the training-mode call above
+    assert mx.allclose(conv(x), folded(x), atol=1e-4, rtol=1e-4).item()
