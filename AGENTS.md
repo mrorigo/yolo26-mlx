@@ -34,12 +34,15 @@ Before believing any change is right, check it against evidence, in this order:
 - Attention reshapes must move the channel axis *before* the spatial axis
   (`transpose(0, 3, 1, 2)`), not after — the wrong order is numerically wrong but still runs.
 - BatchNorm must use Ultralytics' eps=1e-3 / momentum=0.03 (set by their `initialize_weights`),
-  with the *unbiased* variance in the running stats. Keep the two-pass-free form: one `mx.var`
-  reduction and a single fused affine (`x * scale + shift`); the naive form cost 40% of the 640px
-  forward pass.
-- `mx.compile` is inference only, and only on a model in eval mode (`model.compiled()` enforces
-  this). Compiling a training forward either freezes the parameters (scope capture becomes a
-  constant) or re-traces every step (25x slower); see the docstring on `DetectionModel.compiled`.
+  with the *unbiased* variance in the running stats, and it must stay inside the fused
+  conv+BatchNorm+SiLU block: one `mx.var` reduction, one affine, all as graph *arguments*.
+- `mx.compile` **freezes captured arrays but honours scalar and bool arguments**. Every compiled
+  graph in this repo therefore takes weights, buffers and statistics as arguments
+  (`_conv_block`, `_batch_norm_train`); a captured array would silently go stale on the first
+  in-place update.
+- Model-level `mx.compile` is off by default: the per-block graphs already fuse everything, so
+  wrapping the whole model is slower (8.1 ms eager vs 11.7 ms compiled at 640px/b1). It is also
+  inference only, and `DetectionModel.compiled()` enforces that.
 - Anything added to `configs/*.yaml` must be reachable from `config.scale_config` and
   `tasks.DetectionModel._make`; keep the two in sync.
 

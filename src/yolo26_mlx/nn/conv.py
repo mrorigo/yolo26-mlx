@@ -30,12 +30,71 @@ def autopad(k, p=None, d: int = 1):
     return p
 
 
+_REDUCE_AXES = (0, 1, 2)
+
+
+def _conv_block(x, weight, stride, padding, groups, bn_weight, bn_bias, mean, var, eps, act):
+    """conv -> BatchNorm (fixed statistics) -> optional SiLU, as one compiled graph.
+
+    MLX has no fused conv epilogue, so eager mode pays a separate pass for BatchNorm's affine and
+    another for the activation. Fusing the three is worth ~40% on the wide early layers, and works
+    because every value that changes (weights, buffers) is an *argument* - ``mx.compile`` honours
+    scalar and bool arguments but silently freezes captured arrays.
+    """
+    y = mx.conv2d(x, weight, stride=stride, padding=padding, groups=groups)
+    scale = bn_weight * mx.rsqrt(var + eps)
+    y = y * scale + (bn_bias - mean * scale)
+    return y * mx.sigmoid(y) if act else y
+
+
+def _conv_block_train(x, weight, stride, padding, groups, bn_weight, bn_bias, mean, var, eps, momentum, act):
+    """Training-mode :func:`_conv_block`, returning the updated running statistics as well."""
+    y = mx.conv2d(x, weight, stride=stride, padding=padding, groups=groups)
+    n = y.shape[0] * y.shape[1] * y.shape[2]
+    batch_mean = mx.mean(y, axis=_REDUCE_AXES)
+    batch_var = mx.var(y, axis=_REDUCE_AXES)
+    scale = bn_weight * mx.rsqrt(batch_var + eps)
+    out = y * scale + (bn_bias - batch_mean * scale)
+    out = out * mx.sigmoid(out) if act else out
+    unbiased = batch_var * n / max(n - 1, 1)
+    return out, (1 - momentum) * mean + momentum * batch_mean, (1 - momentum) * var + momentum * unbiased
+
+
+_CONV_BLOCK = mx.compile(_conv_block)
+_CONV_BLOCK_TRAIN = mx.compile(_conv_block_train)
+
+
+def _batch_norm_train(x, weight, bias, running_mean, running_var, eps, momentum):
+    """Training-mode BatchNorm: batch statistics, one fused affine, updated buffers.
+
+    Returns the new running statistics alongside the output so the whole thing can be compiled
+    with the buffers as explicit inputs. Capturing them from the module instead would make
+    ``mx.compile`` treat them as constants and silently freeze the statistics after the first call.
+    """
+    axes = (0, 1, 2)
+    n = x.shape[0] * x.shape[1] * x.shape[2]
+    mean = mx.mean(x, axis=axes)
+    var = mx.var(x, axis=axes)
+    scale = weight * mx.rsqrt(var + eps)
+    y = x * scale + (bias - mean * scale)
+    unbiased = var * n / max(n - 1, 1)  # running_var tracks the unbiased estimate
+    return y, (1 - momentum) * running_mean + momentum * mean, (1 - momentum) * running_var + momentum * unbiased
+
+
+_BATCH_NORM_TRAIN = mx.compile(_batch_norm_train)
+
+
 class BatchNorm(Module):
     """BatchNorm over the last axis, with training-time batch statistics.
 
     Defaults follow Ultralytics' ``initialize_weights`` (eps 1e-3, momentum 0.03) rather than
     torch's, so statistics match the reference checkpoints. Running variance tracks the
     unbiased estimate, as in torch.
+
+    Inside :class:`Conv` this class is not what runs: the convolution, this normalisation and the
+    activation are one compiled graph (:func:`_conv_block`), so the weights and statistics come in
+    as arguments. Standalone - outside a Conv - it uses its own shared graph
+    (:func:`_batch_norm_train`); MLX caches per input shape, so all layers share one trace.
     """
 
     def __init__(self, num_features: int, eps: float = 1e-3, momentum: float = 0.03) -> None:
@@ -49,19 +108,16 @@ class BatchNorm(Module):
         self.register_buffer("running_var", mx.ones((num_features,)))
 
     def forward(self, x: mx.array) -> mx.array:
-        axes = (0, 1, 2)
         if self.training:
-            n = x.shape[0] * x.shape[1] * x.shape[2]
-            mean = mx.mean(x, axis=axes)
-            var = mx.var(x, axis=axes)  # one fused reduction; (x - mean)**2 costs two extra passes
-            unbiased = var * n / max(n - 1, 1)  # running_var tracks the unbiased estimate
-            self.running_mean[...] = (1 - self.momentum) * self.running_mean + self.momentum * mean
-            self.running_var[...] = (1 - self.momentum) * self.running_var + self.momentum * unbiased
-        else:
-            mean, var = self.running_mean, self.running_var
+            y, mean, var = _BATCH_NORM_TRAIN(
+                x, self.weight, self.bias, self.running_mean, self.running_var, self.eps, self.momentum
+            )
+            self.running_mean[...] = mean
+            self.running_var[...] = var
+            return y
         # fold the normalisation into an affine map: one elementwise pass instead of three
-        scale = self.weight * mx.rsqrt(var + self.eps)
-        return x * scale + (self.bias - mean * scale)
+        scale = self.weight * mx.rsqrt(self.running_var + self.eps)
+        return x * scale + (self.bias - self.running_mean * scale)
 
 
 class Conv2d(Module):
@@ -115,7 +171,19 @@ class Conv(Module):
         self.act = act
 
     def forward(self, x: mx.array) -> mx.array:
-        return _silu(self.bn(self.conv(x))) if self.act else self.bn(self.conv(x))
+        conv, bn = self.conv, self.bn
+        if self.training:
+            y, mean, var = _CONV_BLOCK_TRAIN(
+                x, conv.weight, conv.s, conv.p, conv.g,
+                bn.weight, bn.bias, bn.running_mean, bn.running_var, bn.eps, bn.momentum, self.act,
+            )
+            bn.running_mean[...] = mean
+            bn.running_var[...] = var
+            return y
+        return _CONV_BLOCK(
+            x, conv.weight, conv.s, conv.p, conv.g,
+            bn.weight, bn.bias, bn.running_mean, bn.running_var, bn.eps, self.act,
+        )
 
     def fuse_into(self) -> Conv2d:
         """Fold BatchNorm into the convolution weights (inference/export only).

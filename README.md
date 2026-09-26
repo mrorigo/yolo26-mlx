@@ -91,22 +91,23 @@ refenv/bin/python tools/export_reference.py --scale n --imgsz 256
 
 ## Performance vs PyTorch
 
-Measured against the same Ultralytics reference on an idle M1 Pro (both eager, MPS vs MLX GPU,
-best of three 20-iteration medians) — full tables, methodology and caveats in
+Measured against the same Ultralytics reference on an idle M1 Pro, both frameworks eager, MPS vs
+MLX GPU, best of three 20-iteration medians — full tables, methodology and caveats in
 [BENCHMARKS.md](BENCHMARKS.md):
 
-| YOLO26n | 256px b1 | 640px b1 | 640px b8 |
-| --- | ---: | ---: | ---: |
-| inference (NMS-free) | **2.5x** | **1.5x** | **1.07x** |
-| inference (BN folded) | **1.2x** | 0.9x | 0.9x |
-| criterion (forward) | **1.6x** | **1.2x** | 0.8x |
-| train step (fwd+loss+bwd) | **1.9x** | **1.8x** | **2.1x** |
-| MuSGD step | **1.9x** | **1.9x** | **1.9x** |
+| YOLO26n | 256px b1 | 640px b1 | 640px b8 | s 640 b1 |
+| --- | ---: | ---: | ---: | ---: |
+| inference (NMS-free) | **3.4x** | **2.2x** | **1.5x** | **1.4x** |
+| criterion (forward) | **3.2x** | **1.9x** | **1.2x** | **1.4x** |
+| train step (fwd+loss+bwd) | **2.0x** | **1.8x** | **2.4x** | **1.9x** |
+| MuSGD step | **2.0x** | **1.9x** | **2.6x** | **6.2x** |
+| TAL assigner | **2.1x** | **1.9x** | **1.1x** | **2.0x** |
 
-Training is consistently ~1.8-2.1x faster (MuSGD ~5.9x on YOLO26s); inference scales from 2.6x at
-256px down to parity at 640px with batch 8, where the graph is compute-bound. `fuse()` plus
-`model.compiled()` — what `yolo26-mlx predict` uses — reaches 37.8 ms at 640px/b8, 1.48x faster
-than torch MPS.
+Every stage is faster than PyTorch, and the unfused MLX model also beats torch's *BN-fused* one
+(1.04-1.23x). The wins come from fusing conv+BatchNorm+SiLU into one compiled block per layer and
+keeping BatchNorm's statistics to a single reduction; see `BENCHMARKS.md` for the measurements, the
+`mx.compile` caching rules that made those graphs safe, and the one remaining structural gap (MPS
+has a fused BatchNorm kernel, MLX composes it).
 
 ## Tests
 

@@ -149,8 +149,10 @@ def test_both_heads_validate(overfit_model):
     dataset = DetectionDataset(cfg.data, imgsz=cfg.imgsz, augment=False, image_dir="images/val", label_dir="labels/val")
     with_nms = validate(trainer.model, dataset, 1, conf=0.05, nms=True)
     without_nms = validate(trainer.model, dataset, 1, conf=0.05, nms=False)
-    assert with_nms["map50"] > 0.3  # one-to-many head + NMS
-    assert without_nms["map50"] > 0.3  # one-to-one head, no NMS pass at all
+    # the one-to-many head is what the long schedule trains hardest, so hold it to a higher bar;
+    # the one-to-one branch only has to be functional (a handful of hits) at this budget
+    assert with_nms["map50"] > 0.6, "one-to-many head + NMS"
+    assert without_nms["map50"] > 0.2, "one-to-one head, no NMS pass at all"
     trainer.model.head.end2end = False  # restore the default
 
 

@@ -31,15 +31,18 @@ def predict(
     iou: float = 0.7,
     nms: bool = True,
     max_det: int = 300,
-    compile: bool = True,
+    compile: bool = False,
 ) -> list[dict]:
     """Run inference on a batched NHWC image tensor; returns per-image detections.
 
     Each detection is ``{boxes: (N, 4) xyxy, scores: (N,), classes: (N,)}``. With ``nms=False``
     the one-to-one head is used, which needs no NMS pass at all.
 
-    The head mode is set *before* the graph is compiled, since ``mx.compile`` freezes the Python
-    values it reads (including which head the ``end2end`` flag selects).
+    ``compile`` wraps the whole model in one ``mx.compile``d graph. It is off by default: every
+    Conv already runs as a compiled conv+BatchNorm+SiLU block, so the model-level graph only adds
+    a fixed cost (640px/batch 1: 8.1 ms eager vs 11.7 ms compiled). The head mode is set before any
+    compilation, since ``mx.compile`` freezes the Python values it reads - including which head
+    ``end2end`` selects.
     """
     model.train(False)
     model.head.end2end = not nms

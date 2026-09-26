@@ -102,15 +102,20 @@ class DetectionModel(Module):
     def compiled(self) -> CompiledModel:
         """Return a view of this model whose forward pass is a single ``mx.compile``d graph.
 
-        Eager mode pays Python dispatch for each of the ~120 layers; compiling the whole graph is
-        worth ~1.4x on inference at 640px. The original model is left untouched, so the compiled and
-        eager paths can both serve the same weights.
+        Since every Conv is already a compiled conv+BatchNorm+SiLU block, this whole-graph view no
+        longer pays off (640px/batch 1: 8.1 ms eager, 11.7 ms compiled) - prefer plain eager, and
+        prefer *unfused* weights too, since folding now removes work the block graph would have
+        fused for free (640px/batch 8: 39.9 ms unfolded, 53.0 ms folded).
 
-        Inference only, and that restriction is deliberate. ``mx.compile`` turns arrays captured
-        from the enclosing scope into constants, so a compiled *training* forward would silently
-        keep the weights at their first-trace values: the loss stops moving after one step. Passing
-        the parameter tree in as an input instead makes the cache miss on every step, because the
-        optimizer hands out fresh arrays - measured 25x slower per step. Training stays eager.
+        Two sharp edges, both measured:
+
+        * Captured arrays are frozen. ``mx.compile`` does not see in-place updates to arrays it
+          captured, so this graph keeps serving the weights and BatchNorm statistics it traced with.
+          Build it after training has finished, and never reuse it across a training step.
+        * Inference only. Compiling a *training* forward either freezes the parameters outright
+          (scope capture becomes a constant: the loss stops moving after one step) or, with the
+          parameter tree passed in as an argument, re-traces the ~1000-input graph every step
+          (25x slower). Training stays eager; that is where the per-block graphs earn their keep.
         """
         if self.training:
             raise RuntimeError(
@@ -121,12 +126,19 @@ class DetectionModel(Module):
 
 
 class CompiledModel(Module):
-    """An ``mx.compile``d view of a :class:`DetectionModel` for inference."""
+    """An ``mx.compile``d view of a :class:`DetectionModel` for inference.
+
+    Kept for completeness, but note that it is currently *slower* than plain eager execution:
+    every Conv already runs as a compiled conv+BatchNorm+SiLU block (:func:`_conv_block`), so the
+    model-level graph only adds a fixed cost (640px/batch 1: 8.1 ms eager, 9.1 ms folded+compiled,
+    11.7 ms compiled). It also has the sharp edges documented on
+    :meth:`DetectionModel.compiled` - captured arrays are frozen for the lifetime of the graph.
+    """
 
     def __init__(self, model: DetectionModel) -> None:
         super().__init__()
         self.inner = model
-        self.graph = mx.compile(model)
+        self.graph = mx.compile(lambda x: model(x))
 
     def forward(self, x):
         return self.graph(x)

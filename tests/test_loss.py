@@ -105,6 +105,67 @@ def test_assigner_handles_empty_batch():
     assert np.array(out[1]).sum() == 0.0
 
 
+def test_batchnorm_training_statistics_accumulate():
+    """The compiled training branch must match the formula and keep updating its buffers.
+
+    The buffers travel through the compiled graph as explicit inputs, so a stale-statistics bug
+    here would silently poison every later epoch.
+    """
+    from yolo26_mlx.nn.conv import BatchNorm
+
+    bn = BatchNorm(8)
+    bn.train(True)
+    momentum, eps, n = bn.momentum, bn.eps, 3 * 5 * 5
+    mean_ref, var_ref = np.zeros(8, np.float32), np.ones(8, np.float32)
+    for step in range(3):
+        data = np.random.default_rng(step).normal(size=(3, 5, 5, 8)).astype(np.float32) * (step + 1) + step
+        y = np.array(bn(mx.array(data)))
+        mean = data.mean(axis=(0, 1, 2))
+        var = data.var(axis=(0, 1, 2))
+        scale = 1.0 / np.sqrt(var + eps)
+        assert np.allclose(y, data * scale - mean * scale, atol=1e-5)
+        mean_ref = (1 - momentum) * mean_ref + momentum * mean
+        var_ref = (1 - momentum) * var_ref + momentum * (var * n / (n - 1))
+        assert np.allclose(np.array(bn.running_mean), mean_ref, atol=1e-5)
+        assert np.allclose(np.array(bn.running_var), var_ref, atol=1e-4)
+
+
+def test_conv_block_matches_eager_formula_and_tracks_buffers():
+    """The fused conv+BatchNorm+SiLU block must match the plain formula, buffers included.
+
+    The block is a single ``mx.compile``d graph shared by every Conv in the model, so its
+    correctness rests on the graph taking weights and running statistics as arguments; if it ever
+    captured them, the statistics would freeze after the first step.
+    """
+    from yolo26_mlx.nn.conv import Conv
+
+    conv = Conv(6, 8, 3, act=True)
+    conv.train(True)
+    bn = conv.bn
+    momentum, eps, n = bn.momentum, bn.eps, 2 * 5 * 5
+    mean_ref, var_ref = np.zeros(8, np.float32), np.ones(8, np.float32)
+    weight_ref, bias_ref = np.ones(8, np.float32), np.zeros(8, np.float32)
+    rng = np.random.default_rng(0)
+    for step in range(3):
+        data = rng.normal(size=(2, 5, 5, 6)).astype(np.float32) * (step + 1) + 0.5 * step
+        out = np.array(conv(mx.array(data)))
+        # reference: conv2d with matching padding, then the BatchNorm/SiLU formula
+        w = np.array(conv.conv.weight).transpose(0, 3, 1, 2)  # (out, in, kh, kw)
+        padded = np.pad(data, ((0, 0), (1, 1), (1, 1), (0, 0)))
+        windows = np.lib.stride_tricks.sliding_window_view(padded, (3, 3), axis=(1, 2))  # (b, y, x, c, 3, 3)
+        conv_out = np.einsum("byxcuv,ocuv->byxo", windows, w).astype(np.float32)
+        mean = conv_out.mean(axis=(0, 1, 2))
+        var = conv_out.var(axis=(0, 1, 2))
+        scale = weight_ref / np.sqrt(var + eps)
+        ref = conv_out * scale + (bias_ref - mean * scale)
+        ref = ref / (1 + np.exp(-ref))
+        assert np.allclose(out, ref, atol=1e-4), f"step {step}"
+        mean_ref = (1 - momentum) * mean_ref + momentum * mean
+        var_ref = (1 - momentum) * var_ref + momentum * (var * n / (n - 1))
+        assert np.allclose(np.array(bn.running_mean), mean_ref, atol=1e-4)
+        assert np.allclose(np.array(bn.running_var), var_ref, atol=1e-3)
+
+
 def test_iou_and_dist_helpers():
     a = mx.array([[0.0, 0.0, 10.0, 10.0]])
     b = mx.array([[0.0, 0.0, 10.0, 10.0]])
