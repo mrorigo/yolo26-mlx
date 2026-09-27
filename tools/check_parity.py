@@ -15,7 +15,7 @@ from pathlib import Path
 import mlx.core as mx
 import numpy as np
 
-REFDIR = Path("/var/folders/7z/v9jlq_zj4jn5n04xjqkwr5400000gn/T/opencode")
+REFDIR = Path("/Users/origo/.cache/yolo26-mlx/ref")
 
 
 def compare(

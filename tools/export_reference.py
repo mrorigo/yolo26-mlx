@@ -62,7 +62,7 @@ def main() -> None:
     ap.add_argument("--scale", default="n")
     ap.add_argument("--imgsz", type=int, default=256)
     ap.add_argument("--cfg", default=str(Path(__file__).resolve().parents[1] / "configs/yolo26.yaml"))
-    ap.add_argument("--out", default="/var/folders/7z/v9jlq_zj4jn5n04xjqkwr5400000gn/T/opencode")
+    ap.add_argument("--out", default="/Users/origo/.cache/yolo26-mlx/ref")
     args = ap.parse_args()
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)

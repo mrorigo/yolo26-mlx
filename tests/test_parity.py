@@ -19,7 +19,7 @@ from yolo26_mlx.loss import DetectionLoss, E2EDetectLoss, LossWeights
 from yolo26_mlx.nn.ops import make_anchors
 
 # where tools/export_reference.py writes its tensors; override with YOLO26_REF_DIR
-REF_DIR = Path(os.environ.get("YOLO26_REF_DIR", "/var/folders/7z/v9jlq_zj4jn5n04xjqkwr5400000gn/T/opencode"))
+REF_DIR = Path(os.environ.get("YOLO26_REF_DIR", "/Users/origo/.cache/yolo26-mlx/ref"))
 
 
 def _require() -> Path:

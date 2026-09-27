@@ -50,7 +50,7 @@ def main() -> None:
     ap.add_argument("--batch", type=int, default=1)
     ap.add_argument("--runs", type=int, default=20)
     ap.add_argument("--nc", type=int, default=80)
-    ap.add_argument("--refdir", default="/var/folders/7z/v9jlq_zj4jn5n04xjqkwr5400000gn/T/opencode")
+    ap.add_argument("--refdir", default="/Users/origo/.cache/yolo26-mlx/ref")
     ap.add_argument("--json", default=None, help="write the results to this file")
     ap.add_argument("--compile", action="store_true", help="wrap the forward passes in mx.compile")
     args = ap.parse_args()

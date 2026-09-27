@@ -61,7 +61,7 @@ def main() -> None:
     ap.add_argument("--nc", type=int, default=80)
     ap.add_argument("--device", default="mps", choices=["mps", "cpu"])
     ap.add_argument("--cfg", default="configs/yolo26.yaml")
-    ap.add_argument("--refdir", default="/var/folders/7z/v9jlq_zj4jn5n04xjqkwr5400000gn/T/opencode")
+    ap.add_argument("--refdir", default="/Users/origo/.cache/yolo26-mlx/ref")
     ap.add_argument("--json", default=None)
     ap.add_argument("--compile", action="store_true", help="wrap the model in torch.compile")
     args = ap.parse_args()

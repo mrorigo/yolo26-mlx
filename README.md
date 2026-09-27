@@ -84,10 +84,16 @@ PARITY OK
 Reproduce with (PyTorch only needed for the exporter, never for the package):
 
 ```bash
-uv venv refenv && uv pip install --python refenv/bin/python torch ultralytics safetensors
-refenv/bin/python tools/export_reference.py --scale n --imgsz 256
+REF=~/.cache/yolo26-mlx/ref
+uv venv $REF/refenv && uv pip install --python $REF/refenv/bin/python torch ultralytics safetensors
+$REF/refenv/bin/python tools/export_reference.py --scale n --imgsz 256
 .venv/bin/python tools/check_parity.py --scale n --imgsz 256
 ```
+
+The reference env and the exported tensors live in `~/.cache/yolo26-mlx/ref` (1.6 GB), deliberately
+outside both the repo and `/var/folders`, which macOS periodically reaps - a reaped reference made the
+parity tests skip silently rather than fail. Point `--refdir` / `YOLO26_REF_DIR` elsewhere if you keep
+it somewhere else.
 
 ## Performance vs PyTorch
 
@@ -135,6 +141,8 @@ src/yolo26_mlx/
   metrics.py      NMS, precision/recall, COCO-style mAP
   train.py        Trainer (MuSGD + schedules) and validate()
   cli.py          command line entry point
+configs/          YOLO26 model graphs (Ultralytics)
+tools/            reference exporter, parity checker, benchmarks, profilers
 ```
 
 ## Licence
