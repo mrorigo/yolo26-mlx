@@ -35,11 +35,17 @@ expression, and they are independently corroborated here: the graphs in these fi
 published parameter counts exactly, which `tests/test_model.py` asserts for all five scales
 (2,572,280 / 10,009,784 / 21,896,248 / 26,299,704 / 58,993,368).
 
-`MUSGD_SPEC.md` is likewise an independent behavioural specification of the optimizer, written so
-the optimizer could be reimplemented from the description alone. It was validated by implementing
-its pseudocode from scratch and checking against the reference's own output (exact on the plain-group
-trajectory and both momentum buffers, within 2e-4 on the Muon-group trajectory). Where our
-implementation deliberately differs from upstream it says so, e.g. the per-tensor update scale.
+### The optimizer specification
+
+The MuSGD behaviour is likewise specified independently in prose, so that the optimizer can be
+reimplemented from a description rather than from AGPL source. That document is deliberately **not
+in this repository** - it is being consumed by the parallel Rust/Candle port of this model, which
+implements its optimizer from the specification alone. Its authority here is indirect: the
+eager-oracle tests in `tests/test_optim.py` transcribe the same specification and check the shipped
+optimizer against it (exact on the plain-group trajectory and both momentum buffers, within 1e-5 on
+the Muon-group trajectory, where the small residual is the reference's bfloat16 orthogonalization).
+Where this implementation deliberately differs from upstream it says so in the code, e.g. the
+per-tensor update scale.
 
 ## Audit of the code
 
@@ -64,9 +70,17 @@ is a fact- and jurisdiction-specific question. Get counsel to sign off before di
 
 ## Note on history
 
-The two configuration files were byte-identical copies of AGPL-licensed upstream files when the
-repository was first published, and are still reachable in its git history. The working tree no
-longer contains any upstream material.
+The two configuration files were byte-identical copies of AGPL-licensed upstream files when this
+repository was first published. They have since been re-derived (see above), and the history was
+rewritten with `git filter-repo --invert-paths` to purge those two paths from every commit, so the
+published history no longer contains them. All commit ids therefore differ from the first
+publication, and the pre-rewrite history is not preserved here.
+
+Rewriting history is not erasure: GitHub keeps unreachable objects for some time, so the old blobs
+may still be retrievable by object id, and any clone or fork taken before the rewrite still
+contains them. The practical exposure is small - those files were 112 lines of architecture
+parameters, identical in every numeric value to ours and differing only in commentary and file
+header - but it is not zero, and this note is here so nobody has to rediscover that.
 
 ## What is ours
 

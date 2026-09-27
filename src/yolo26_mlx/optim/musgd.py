@@ -163,7 +163,8 @@ class MuSGD:
                 continue
             self._ensure_state(names)
             # The SGD component of a Muon group runs on the *post-Muon* parameters, so the Muon
-            # update lands first (see MUSGD_SPEC.md, "step order inside a muon group").
+            # update lands first: the SGD component sees the post-Muon parameter, which also
+            # makes its weight-decay term depend on the Muon step.
             if group["use_muon"]:
                 self._muon_step(names, grads, group)
                 self._sgd_step(names, grads, {**group, "lr": group["lr"] * self.sgd})

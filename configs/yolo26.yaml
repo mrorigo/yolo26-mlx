@@ -1,0 +1,81 @@
+# YOLO26 detector, expressed for this implementation's graph builder.
+#
+# Format: each row is [from, repeats, module, args].
+#   from     - index of the layer to read from, 0-based; -1 is the previous layer
+#   repeats  - how many times the module is stacked (scaled by the depth factor)
+#   module   - a name from yolo26_mlx.tasks.DetectionModel._make
+#   args     - positional arguments after (c_in, c_out), which are filled in for you
+#
+# Channel counts below are the architecture's, not this file's: they are the published
+# YOLO26 numbers, independently confirmed by this implementation's parameter counts
+# (see tests/test_model.py and the per-scale table in PROVENANCE.md).
+#
+# Detection runs at three strides, P3/8, P4/16 and P5/32. The head regresses four
+# ltrb distances per anchor and classifies; there is no distribution branch, because
+# YOLO26 regresses unbounded distances directly (reg_max: 1 below).
+
+nc: 80          # classes in the COCO-style label set
+end2end: True    # build the NMS-free one-to-one head as well as the one-to-many head
+reg_max: 1      # 1 = plain ltrb regression; only >1 would mean a DFL distribution
+
+# Compound scaling: [depth multiplier, width multiplier, channel ceiling].
+scales:
+  n: [0.50, 0.25, 1024]
+  s: [0.50, 0.50, 1024]
+  m: [0.50, 1.00, 512]
+  l: [1.00, 1.00, 512]
+  x: [1.00, 1.50, 512]
+
+# ---------------------------------------------------------------- backbone
+backbone:
+  # Stem: two stride-2 convolutions take the image to P2/4 at 64 channels.
+  - [-1, 1, Conv, [64, 3, 2]]
+  - [-1, 1, Conv, [128, 3, 2]]
+
+  # P2/4 stage. Narrow expansion (0.25) keeps the early blocks cheap.
+  - [-1, 2, C3k2, [256, False, 0.25]]
+
+  # Down to P3/8 - the finest stride the head detects on.
+  - [-1, 1, Conv, [256, 3, 2]]
+  - [-1, 2, C3k2, [512, False, 0.25]]
+
+  # Down to P4/16.
+  - [-1, 1, Conv, [512, 3, 2]]
+  - [-1, 2, C3k2, [512, True]]
+
+  # Down to P5/32, the widest feature map.
+  - [-1, 1, Conv, [1024, 3, 2]]
+  - [-1, 2, C3k2, [1024, True]]
+
+  # Spatial pyramid pooling: three 5x5 max-pools widen the receptive field cheaply.
+  - [-1, 1, SPPF, [1024, 5, 3, True]]
+
+  # Position-sensitive attention over the 20x20 grid, then the same block again.
+  - [-1, 2, C2PSA, [1024]]
+
+# -------------------------------------------------------------------- head
+# A standard PAN: top-down, fuse with the backbone, then bottom-up again.
+head:
+  # P5 -> P4, fused with the backbone's P4 output (layer 6).
+  - [-1, 1, nn.Upsample, [None, 2, "nearest"]]
+  - [[-1, 6], 1, Concat, [1]]
+  - [-1, 2, C3k2, [512, True]]
+
+  # P4 -> P3, fused with the backbone's P3 output (layer 4). This is the small-object head.
+  - [-1, 1, nn.Upsample, [None, 2, "nearest"]]
+  - [[-1, 4], 1, Concat, [1]]
+  - [-1, 2, C3k2, [256, True]]          # -> P3/8
+
+  # Bottom-up: P3 -> P4, fused with the top-down path (layer 13).
+  - [-1, 1, Conv, [256, 3, 2]]
+  - [[-1, 13], 1, Concat, [1]]
+  - [-1, 2, C3k2, [512, True]]           # -> P4/16
+
+  # P4 -> P5, fused with the backbone's attention output (layer 10). This head carries the
+  # position-sensitive attention block.
+  - [-1, 1, Conv, [512, 3, 2]]
+  - [[-1, 10], 1, Concat, [1]]
+  - [-1, 1, C3k2, [1024, True, 0.5, True]]   # -> P5/32
+
+  # One head for all three strides: 4 box channels plus nc class channels per anchor.
+  - [[16, 19, 22], 1, Detect, [nc]]

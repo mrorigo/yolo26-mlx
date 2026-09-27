@@ -98,7 +98,7 @@ def test_weight_decay_only_affects_its_group():
 
 
 def _eager_musgd(params, grads, muon, sgd, lr, beta, weight_decay, nesterov, use_muon, steps):
-    """Straight transcription of MUSGD_SPEC.md, used to check the compiled implementation.
+    """Straight transcription of the MuSGD specification, used to check the compiled implementation.
 
     Deliberately unoptimised: no grouping, no batching, plain float32 arithmetic.
     """
