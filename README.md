@@ -145,7 +145,10 @@ configs/          YOLO26 model graphs (Ultralytics)
 tools/            reference exporter, parity checker, benchmarks, profilers
 ```
 
-## Licence
+## Licence and provenance
 
-The model architecture configuration in `configs/` follows Ultralytics YOLO26 (AGPL-3.0). All code
-here is an independent MLX implementation.
+Released under the terms in `LICENSE`. [`PROVENANCE.md`](PROVENANCE.md) records where every part
+comes from: the YOLO26 paper, the Muon paper, and the PyTorch reference used only as a
+development-time parity oracle (never vendored, never a runtime dependency). It also includes the
+audit of this source against that reference.
+
