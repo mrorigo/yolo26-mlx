@@ -106,13 +106,13 @@ MLX GPU, best of three 20-iteration medians — full tables, methodology and cav
 | inference (NMS-free) | **3.4x** | **2.2x** | **1.6x** | **1.4x** |
 | criterion (forward) | **3.5x** | **2.1x** | **1.5x** | **1.5x** |
 | train step (fwd+loss+bwd) | **2.0x** | **1.8x** | **2.5x** | **1.9x** |
-| MuSGD step | **2.0x** | **1.9x** | **2.6x** | **6.2x** |
+| MuSGD step | **5.6x** | **5.6x** | **7.7x** | **17.6x** |
 | TAL assigner | **2.1x** | **1.9x** | **1.1x** | **2.0x** |
 
 Every stage is faster than PyTorch, and the unfused MLX model also beats torch's *BN-fused* one
 (1.04-1.23x). The wins come from fusing conv+BatchNorm+SiLU into one compiled block per layer,
-compiling the assigner's broadcast geometry, keeping the alignment targets sparse, and prefetching
-batches so augmentation overlaps the GPU. End-to-end training throughput (augmentation included) is
+compiling the assigner's broadcast geometry and the optimizer's per-tensor passes, keeping the
+alignment targets sparse, and prefetching batches so augmentation overlaps the GPU. End-to-end training throughput (augmentation included) is
 18 -> 45 img/s with `workers=2`, against a 95 img/s compute ceiling. `BENCHMARKS.md` has the
 measurements, the `mx.compile` caching rules that made those graphs safe, and what is left
 (`mx.argpartition` in the assigner, GIL contention in the loader).

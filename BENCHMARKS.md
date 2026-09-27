@@ -26,7 +26,7 @@ most cells.
 | inference, NMS-free head | **3.4x** | **2.2x** | **1.6x** | **1.4x** |
 | criterion (forward) | **3.5x** | **2.1x** | **1.5x** | **1.5x** |
 | train step (fwd+loss+bwd) | **2.0x** | **1.8x** | **2.5x** | **1.9x** |
-| MuSGD step | **2.0x** | **1.9x** | **2.6x** | **6.2x** |
+| MuSGD step | **5.6x** | **5.6x** | **7.7x** | **17.6x** |
 | TAL assigner | **2.1x** | **1.9x** | **1.1x** | **2.0x** |
 
 Raw medians (ms), MLX eager vs torch MPS:
@@ -36,7 +36,7 @@ Raw medians (ms), MLX eager vs torch MPS:
 | inference (NMS-free) | 4.8 | 8.1 | 38.1 | 15.3 |
 | criterion (forward) | 11.5 | 18.3 | 83.4 | 27.7 |
 | train step (fwd+loss+bwd) | 34.2 | 42.2 | 142.1 | 54.6 |
-| MuSGD step | 21.4 | 21.5 | 21.8 | 20.7 |
+| MuSGD step | 7.3 | 7.3 | 7.5 | 7.3 |
 | TAL assigner | 1.1 | 1.2 | 5.2 | 1.2 |
 | *torch reference* | *16.4* | *17.7* | *59.1* | *22.2* |
 
@@ -132,6 +132,9 @@ and is the obvious next step rather than more threading.
   are sparse - the criterion uses `(label, scale)` per anchor instead of materialising a dense
   `(b, A, nc)` one-hot matrix, which also lets BCE collapse to `sum(softplus) - sum(positives)`.
   Overall 45.8 -> 24.8 ms per branch at 100 objects/image.
+- **The optimizer's remaining 8 ms is the Newton-Schulz iterations**, which stay eager: they run on
+  a handful of differently-shaped batches, and compiling one graph per shape would cost more in
+  tracing than it saves.
 - **`mx.argpartition` is now the floor of the assigner**: ~7 ms for one (8, 100, 8400) partition, and
   the reference needs one (top-k) plus a second for `topk2`. A blocked two-stage top-k (max-pool
   blocks, then partition only the winning blocks) would cut that to ~1-2 ms, at the cost of an

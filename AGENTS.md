@@ -11,7 +11,7 @@ depend on it.
 ## Correctness bar
 Before believing any change is right, check it against evidence, in this order:
 
-1. `uv run pytest -q` — 50 tests, ~21s, must stay green.
+1. `uv run pytest -q` — 52 tests, ~21s, must stay green.
 2. `uv run python tools/check_parity.py --scale n --imgsz 256` — numerical parity with PyTorch
    (forward, both branch outputs, decoded outputs, NMS-free top-k, both loss terms). Needs
    reference data from `tools/export_reference.py`; the parity tests skip if it is missing.
@@ -43,6 +43,10 @@ Before believing any change is right, check it against evidence, in this order:
   graph in this repo therefore takes weights, buffers and statistics as arguments
   (`_conv_block`, `_batch_norm_train`); a captured array would silently go stale on the first
   in-place update.
+- **Values that change every step must cross a compiled boundary as 0-d arrays, not as Python
+  scalars.** `mx.compile` specialises on scalar *values*, so a float learning rate re-traces the
+  graph every step (measured: 230 ms/step). The optimizer's lr/momentum/weight decay are arrays for
+  exactly this reason.
 - Model-level `mx.compile` is off by default: the per-block graphs already fuse everything, so
   wrapping the whole model is slower (8.1 ms eager vs 11.7 ms compiled at 640px/b1). It is also
   inference only, and `DetectionModel.compiled()` enforces that.

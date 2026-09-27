@@ -97,6 +97,78 @@ def test_weight_decay_only_affects_its_group():
     assert float(params["b"][0]) == 1.0
 
 
+def _eager_musgd(params, grads, muon, sgd, lr, beta, weight_decay, nesterov, use_muon, steps):
+    """Straight transcription of MUSGD_SPEC.md, used to check the compiled implementation.
+
+    Deliberately unoptimised: no grouping, no batching, plain float32 arithmetic.
+    """
+    import numpy as np
+
+    from yolo26_mlx.optim.musgd import newton_schulz
+
+    p = {k: np.array(v) for k, v in params.items()}
+    muon_buf = {k: np.zeros_like(v) for k, v in p.items()}
+    sgd_buf = {k: np.zeros_like(v) for k, v in p.items()}
+    for _ in range(steps):
+        for k, g0 in grads.items():
+            g = np.array(g0)
+            lr_eff = lr
+            if use_muon and p[k].ndim >= 2:
+                muon_buf[k] = beta * muon_buf[k] + (1 - beta) * g
+                u = beta * muon_buf[k] + (1 - beta) * g if nesterov else muon_buf[k]
+                # a conv weight is orthogonalized as one (rows, cols) matrix, not per spatial tap
+                if u.ndim > 2:
+                    u = u.reshape(u.shape[0], -1)
+                u = np.array(newton_schulz(mx.array(u))).reshape(p[k].shape)
+                scale = max(1.0, p[k].shape[-2] / p[k].shape[-1]) ** 0.5
+                p[k] = p[k] - lr * muon * scale * u
+                lr_eff = lr * sgd
+            gp = g + weight_decay * p[k] if weight_decay else g
+            sgd_buf[k] = beta * sgd_buf[k] + gp
+            p[k] = p[k] - lr_eff * (gp + beta * sgd_buf[k] if nesterov else sgd_buf[k])
+    return p, muon_buf, sgd_buf
+
+
+def test_compiled_passes_match_the_specification():
+    """The compiled SGD and Muon passes must agree with a literal transcription of the spec.
+
+    This is the regression guard for batching the per-tensor work: the eager transcription is the
+    oracle, and it encodes the two buffer recurrences and the post-Muon weight-decay ordering.
+    """
+    mx.random.seed(0)
+    shapes = {"w2d": (16, 8), "w4d": (12, 4, 3, 3), "bias": (16,), "norm": (8,)}
+    params = {k: mx.random.normal(s) for k, s in shapes.items()}
+    opt = MuSGD(params, [{"keys": list(params), "use_muon": True}], lr=0.1, momentum=0.9,
+                weight_decay=0.01, nesterov=True, muon=0.2, sgd=1.0)
+    grads = {k: mx.random.normal(s) * 0.5 for k, s in shapes.items()}
+    initial = {k: np.array(v) for k, v in params.items()}  # the eager oracle must start here
+    for _ in range(3):
+        opt.step(grads)
+    ref_p, ref_m, ref_s = _eager_musgd(initial, grads, 0.2, 1.0, 0.1, 0.9, 0.01, True, True, steps=3)
+    for k in params:
+        assert np.allclose(np.array(params[k]), ref_p[k], atol=1e-5), f"parameter {k}"
+    for k in params:
+        if params[k].ndim >= 2:
+            assert np.allclose(np.array(opt.state[k]["muon_buf"]), ref_m[k], atol=1e-6), f"muon buffer {k}"
+    for k in params:
+        assert np.allclose(np.array(opt.state[k]["buf"]), ref_s[k], atol=1e-5), f"sgd buffer {k}"
+
+
+def test_plain_group_matches_the_specification():
+    """Non-Nesterov and non-muon paths, including weight decay."""
+    mx.random.seed(1)
+    params = {"a": mx.random.normal((6, 3)), "b": mx.random.normal((5,))}
+    opt = MuSGD(params, [{"keys": list(params)}], lr=0.05, momentum=0.8, weight_decay=0.1, nesterov=False)
+    grads = {k: mx.random.normal(v.shape) for k, v in params.items()}
+    initial = {k: np.array(v) for k, v in params.items()}
+    for _ in range(2):
+        opt.step(grads)
+    ref_p, _, ref_s = _eager_musgd(initial, grads, 0.2, 1.0, 0.05, 0.8, 0.1, False, False, steps=2)
+    for k in params:
+        assert np.allclose(np.array(params[k]), ref_p[k], atol=1e-6), f"parameter {k}"
+        assert np.allclose(np.array(opt.state[k]["buf"]), ref_s[k], atol=1e-6), f"buffer {k}"
+
+
 def test_param_groups_split_by_rank_and_role():
     class Hyp:
         lr0 = 0.01
