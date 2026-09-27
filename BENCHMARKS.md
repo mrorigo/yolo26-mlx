@@ -41,37 +41,43 @@ Raw medians (ms), MLX eager vs torch MPS:
 | *torch reference* | *16.4* | *17.7* | *59.1* | *22.2* |
 
 Torch's own BN-fused model (its best inference configuration) is 8.4 ms at 640 b1, 49.1 ms at 640 b8
-and 17.0 ms on s. The unfused MLX model is faster than that too (8.1 / 39.9 / 16.1 ms), i.e. 1.04x,
-1.23x and 1.06x against torch at its own best.
+and 17.0 ms on s. The unfused MLX model is faster than that too (8.1 / 39.9 / 15.3 ms), i.e. 1.04x,
+1.23x and 1.11x against torch at its own best.
 
-## What the optimization pass changed
+## Optimization log
 
-Profiling drove three changes, each verified by `tools/check_parity.py` (unchanged) and the test
-suite. Numbers are YOLO26n at 640px.
+Three profiling-driven passes, in order. Every number below is YOLO26n at 640px unless stated,
+best of three 20-iteration medians, and every pass was checked against `tools/check_parity.py` (the
+parity result is unchanged throughout) and the test suite.
 
-| | before | after |
+| | start | now |
 | --- | ---: | ---: |
 | eval forward, batch 1 | 11.5 ms | **8.1 ms** |
 | eval forward, batch 8 | 55.5 ms | **39.9 ms** |
-| train-mode forward, batch 8 | 96.7 ms | **60.3 ms** |
-| train step (fwd+loss+bwd), batch 8 | 169.6 ms | **148.8 ms** |
-| criterion (forward), batch 8 | 131.8 ms | **99.0 ms** |
-| 640 b8 inference vs torch | 0.91x | **1.48x** |
-| 640 b8 criterion vs torch | 0.78x | **1.24x** |
+| train-mode forward, batch 8 | 113.7 ms | **60.3 ms** |
+| criterion (forward), batch 8 | 148.1 ms | **83.4 ms** |
+| train step (fwd+loss+bwd), batch 8 | 169.6 ms | **142.1 ms** |
+| MuSGD step | 22.2 ms | **7.3 ms** |
+| 640 b8 inference vs torch | 0.91x | **1.6x** |
+| 640 b8 criterion vs torch | 0.78x | **1.5x** |
+| end-to-end training | 18.1 img/s | **45.4 img/s** |
 
-**1. BatchNorm statistics: one reduction, one affine.** `mx.mean` + `mx.var` + `mx.rsqrt` replaced a
-materialised `(x - mean)**2`, and the normalisation folds into a single affine `x * scale + shift`.
+### Pass 1 — the model forward: one compiled conv + BatchNorm + SiLU block
 
-**2. Fused conv + BatchNorm + SiLU block.** MLX has no conv epilogue, so eager mode paid a
-separate pass for the BatchNorm affine and another for the activation. `Conv.forward` is now one
-`mx.compile`d function per block, *shared across all layers* (MLX caches per input shape), which is
-worth ~40% on the wide early layers.
+**BatchNorm statistics.** `mx.mean` + `mx.var` + `mx.rsqrt` replaced a materialised
+`(x - mean)**2`, and the normalisation folds into a single affine `x * scale + shift`. Train-mode
+forward 113.7 -> 96.7 ms; criterion 148.1 -> 131.8 ms.
 
-**3. The compile-cache rules that made it safe.** Measured directly:
+**The fused block.** MLX has no conv epilogue, so eager mode still paid a separate pass for the
+BatchNorm affine and another for the activation. `Conv.forward` became one `mx.compile`d function
+*shared across all layers* (MLX caches per input shape), worth ~40% on the wide early layers: eval
+forward 55.5 -> 39.9 ms at batch 8, train-mode forward 96.7 -> 60.3 ms.
 
-- `mx.compile` **freezes arrays captured from the enclosing scope** - a function that multiplies by
-  a captured `w` keeps returning `x * 2` after `w[...] = 5`. So the block takes the conv weight and
-  the running statistics as *arguments*.
+**The compile-cache rules that made it safe** - all three measured directly:
+
+- `mx.compile` **freezes arrays captured from the enclosing scope**: a function multiplying by a
+  captured `w` keeps returning `x * 2` after `w[...] = 5`. The block therefore takes the conv weight
+  and the running statistics as *arguments*.
 - **Scalar and bool arguments are honoured** (`stride`, `padding`, `groups`, `act` can be passed in
   and reused across layers).
 - A compiled **training** forward is a trap either way: captured parameters freeze the model (the
@@ -79,17 +85,55 @@ worth ~40% on the wide early layers.
   an argument misses the cache every step (4.6 s/step, 25x slower). `DetectionModel.compiled()`
   therefore refuses to run in training mode.
 
-With the per-block fusion in place, a model-level `mx.compile` no longer pays off (640 b1: 8.1 ms
-eager, 9.1 ms folded+compiled, 11.7 ms compiled), so it is off by default in `predict()`. The same
-fusion *helps* the folded model less than the unfolded one, because folding removes work the block
-graph would have fused for free (640 b8: 39.9 ms unfolded, 53.0 ms folded) - folding is for export,
-not for MLX inference.
+With per-block fusion in place a model-level `mx.compile` no longer pays off (640 b1: 8.1 ms eager,
+9.1 ms folded+compiled, 11.7 ms compiled), so `predict()` is eager. The same fusion *helps* the folded
+model less than the unfolded one, because folding removes work the block graph would have fused for
+free (640 b8: 39.9 ms unfolded, 53.0 ms folded) - folding is for export, not for MLX inference.
+
+### Pass 2 — the criterion, the label assignment and the data pipeline
+
+**The criterion was hiding behind the benchmark's two objects per image.** The assigner is evaluated
+over a (batch, ground truths, anchors) tensor, so object count dominates it. At 640px/batch 8:
+
+| objects/image | criterion per branch, before | after |
+| ---: | ---: | ---: |
+| 2 | 9.8 ms | 7.7 ms |
+| 20 | 15.5 ms | 10.5 ms |
+| 100 | 45.8 ms | 24.8 ms |
+
+Three changes, each measured in isolation: the CIoU over the broadcast geometry is now one compiled
+graph (18.7 -> 3.8 ms at 100 objects); the top-k claim count is one reduction instead of a Python
+loop per ground truth (the worst scaling bug in the codebase: 6.0 -> 3.3 ms); and the alignment
+targets became *sparse*, so the criterion carries a label and a scale per anchor instead of
+materialising a dense `(b, A, nc)` one-hot matrix - which also lets BCE collapse to
+`sum(softplus) - sum(positives)`. Two shape-contract bugs surfaced on the way and are fixed: the
+empty-batch path returned a per-image scale where the normaliser is per-anchor, and it returned the
+wrong length.
+
+**Data loading overlapped** (see the next section): 18.1 -> 45.4 img/s.
+
+### Pass 3 — the optimizer: launch-bound, not arithmetic-bound
+
+The step took ~22 ms for *every* scale, because the tensor count is identical regardless of width
+(366 tensors: 126 muon, 240 plain) - about 40 us per tensor of kernel-launch overhead. Compiling the
+momentum recurrences and parameter updates into one graph per pass took the step from **22.2 ms to
+8.2 ms** (n) and **22.7 ms to 8.3 ms** (s), which is 5.6x and 17.6x the reference MuSGD. On a full
+training step that is 129.3 -> 119.6 ms at batch 8 (61.9 -> 66.9 img/s, +8%).
+
+This one hinged on a second `mx.compile` property: it specialises on scalar argument *values*, so
+passing the learning rate as a Python float re-traces the graph on every step under a schedule -
+**230 ms a step**, far worse than the 22 ms being saved. The same scalars as 0-d arrays are graph
+inputs, so the trace is reused (0.5 ms a call) and the new value is honoured. The compiled pass
+returns new trees and the caller assigns them per tensor, which measures 0.07 ms for 366 tensors.
+
+Newton-Schulz deliberately stays eager: it runs on a handful of differently-shaped batches, and
+tracing one graph per shape would cost more than it saves. That is what the remaining 8 ms is.
 
 ## End-to-end training throughput
 
 The tables above are model-only. With augmentation included (720p source images, 640px, batch 16,
-mosaic on), the pipeline is different: augmentation is PIL/NumPy on the CPU and does not touch the
-GPU, so it has to overlap with the training step.
+mosaic on) the pipeline is different, because augmentation is PIL/NumPy on the CPU and never touches
+the GPU - it has to overlap with the training step (pass 2 above).
 
 | configuration | img/s |
 | --- | ---: |
@@ -126,20 +170,16 @@ and is the obvious next step rather than more threading.
   | 20 | 10.5 ms | 7.2 ms |
   | 100 | 24.8 ms | 21.5 ms |
 
-  What the optimization pass changed here: the CIoU over that broadcast geometry is now one
-  compiled graph (18.7 -> 3.8 ms), the top-k claim count is one reduction instead of a Python loop
-  per ground truth (the single worst scaling bug: 6.0 -> 3.3 ms at G=100), and the alignment targets
-  are sparse - the criterion uses `(label, scale)` per anchor instead of materialising a dense
-  `(b, A, nc)` one-hot matrix, which also lets BCE collapse to `sum(softplus) - sum(positives)`.
-  Overall 45.8 -> 24.8 ms per branch at 100 objects/image.
-- **The optimizer's remaining 8 ms is the Newton-Schulz iterations**, which stay eager: they run on
-  a handful of differently-shaped batches, and compiling one graph per shape would cost more in
-  tracing than it saves.
-- **`mx.argpartition` is now the floor of the assigner**: ~7 ms for one (8, 100, 8400) partition, and
+  Pass 2 above cut this from 45.8 to 24.8 ms per branch at 100 objects/image; the floor is now
+  `mx.argpartition` (below).
+- **`mx.argpartition` is the floor of the assigner**: ~7 ms for one (8, 100, 8400) partition, and
   the reference needs one (top-k) plus a second for `topk2`. A blocked two-stage top-k (max-pool
   blocks, then partition only the winning blocks) would cut that to ~1-2 ms, at the cost of an
   exactness caveat around ties. Not done.
-- **`fuse()` is a deployment tool, not a speed-up here** (see above).
+- **The optimizer's 8 ms is Newton-Schulz, left eager on purpose** (see pass 3): it runs on a
+  handful of differently-shaped batches, and one compiled graph per shape would cost more in tracing
+  than it saves.
+- **`fuse()` is a deployment tool, not a speed-up here** (see pass 1).
 
 ## Caveats
 
